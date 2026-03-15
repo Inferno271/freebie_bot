@@ -2,9 +2,10 @@ import os
 import json
 import logging
 import time
+import random
 import requests
 from bs4 import BeautifulSoup
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,14 +25,50 @@ BATCH_SIZE = 2           # Сколько постов слать подряд
 BATCH_DELAY = 600        # Пауза между пачками постов (в секундах, например 600 = 10 мин)
 
 TAGS = "#халява #бесплатно #free #игры"
-GREETINGS = [
+
+# --- ГУМАНИЗАТОР: НАБОРЫ ТЕКСТОВ ---
+
+GREETINGS_HUGE = [
     "🔥 <b>ПОДЪЕХАЛА ГОДНОТА!</b>",
     "💸 <b>ЗАБИРАЙ, ПОКА БЕСПЛАТНО!</b>",
     "🎮 <b>100% СКИДКА! ТАКОЕ МЫ БЕРЕМ!</b>",
     "🚀 <b>СРОЧНЫЙ ДРОП! НАЛЕТАЙ!</b>",
     "🎁 <b>ПОДАРОЧЕК ДЛЯ ВАШЕЙ БИБЛИОТЕКИ!</b>",
-    "✨ <b>НОВЫЙ ЛУТ В КОЛЛЕКЦИЮ!</b>"
+    "✨ <b>НОВЫЙ ЛУТ В КОЛЛЕКЦИЮ!</b>",
+    "💎 <b>АЛМАЗ НАЙДЕН! ЗАБИРАЕМ:</b>",
+    "🚨 <b>АТЕНЬШН! ОЧЕРЕДНАЯ ХАЛЯВА:</b>"
 ]
+
+GREETINGS_CASUAL = [
+    "Привет, геймеры! Смотрите, что нашел:",
+    "Опа, еще одна раздача подъехала!",
+    "Не проходим мимо, сегодня раздают это:",
+    "Всем доброго времени суток! Ловите свежий подгон:",
+    "Если искали, во что поиграть — вот вариант за 0 рублей:"
+]
+
+SIGN_OFFS = [
+    "Приятной игры! 🕹",
+    "Увидимся в онлайне! ✌️",
+    "Не забудь рассказать друзьям! 📢",
+    "Жми на кнопку ниже, пока не закончилось! 👇",
+    "Пополнил коллекцию? Ставь лайк! ❤️"
+]
+
+GENRE_EMOJIS = {
+    "action": "🧨",
+    "rpg": "🗡",
+    "shooter": "🔫",
+    "racing": "🏎",
+    "strategy": "🧠",
+    "indie": "🎨",
+    "horror": "👻",
+    "puzzle": "🧩",
+    "adventure": "🗺",
+    "default": "👾"
+}
+
+# --- ФУНКЦИИ ---
 
 def load_posted_ids() -> List[str]:
     if os.path.exists(POSTED_IDS_FILE):
@@ -43,12 +80,11 @@ def load_posted_ids() -> List[str]:
     return []
 
 def save_posted_ids(ids: List[str]):
-    # Оставляем только последние 500 ID, чтобы файл не разрастался
     with open(POSTED_IDS_FILE, 'w', encoding='utf-8') as f:
         json.dump(ids[-500:], f, indent=4)
 
 def fetch_reddit_freebies() -> List[Dict]:
-    """Парсинг сабреддита /r/FreeGameFindings через RSS (более стабильно для ботов)"""
+    """Парсинг сабреддита /r/FreeGameFindings через RSS"""
     logger.info("Поиск на Reddit...")
     url = "https://www.reddit.com/r/FreeGameFindings/new/.rss"
     headers = {
@@ -70,37 +106,41 @@ def fetch_reddit_freebies() -> List[Dict]:
             id_tag = entry.find("id")
             post_id = id_tag.text.split("/")[-1] if id_tag else str(time.time())
             
-            # Фильтрация
             if any(x.lower() in title.lower() for x in ["[Discussion]", "[PSA]", "Megathread", "Thread", "Ended", "Expired"]):
                 continue
             
-            # В RSS ссылка в теге <link> ведет на Reddit. 
-            # Нам нужна ПРЯМАЯ ссылка на магазин/сайт.
-            # Она обычно запрятана в <content> внутри тега <a> с текстом [link]
             direct_url = ""
-            content = entry.find("content").text if entry.find("content") else ""
-            if content:
-                c_soup = BeautifulSoup(content, "html.parser")
-                # Ищем ссылку, которая содержит текст [link]
+            image_url = ""
+            description = ""
+            
+            content_tag = entry.find("content")
+            if content_tag:
+                c_soup = BeautifulSoup(content_tag.text, "html.parser")
+                # Ищем прямую ссылку
                 for a in c_soup.find_all("a"):
                     if "[link]" in a.text:
                         direct_url = a.get("href")
                         break
                 
-                # Поиск картинки (если есть)
+                # Ищем картинку
                 img = c_soup.find("img")
                 if img:
                     image_url = img.get("src")
-
-            # Если не нашли прямую ссылку, берем ссылку на пост в Reddit
-            final_url = direct_url if direct_url else url
+                
+                # Пытаемся вытянуть хоть какой-то текст
+                all_text = c_soup.get_text(separator=" ").strip()
+                if len(all_text) > 20: 
+                    # Обрезаем лишнее (обычно в Reddit RSS много тех. ссылок)
+                    description = all_text.split("submitted by")[0].strip()[:200]
 
             games.append({
                 "id": f"reddit_{post_id}",
                 "title": title,
-                "url": final_url,
+                "url": direct_url if direct_url else url,
                 "image_url": image_url,
-                "source": "Reddit"
+                "description": description,
+                "source": "Reddit",
+                "price": None
             })
     except Exception as e:
         logger.error(f"Ошибка Reddit RSS: {e}")
@@ -110,86 +150,70 @@ def fetch_reddit_freebies() -> List[Dict]:
 def fetch_epic_games_freebies() -> List[Dict]:
     """Парсинг официального API раздач Epic Games Store"""
     logger.info("Поиск в Epic Games...")
-    # Убираем жесткую привязку к RU, чтобы избежать пустых ответов из-за региональных ограничений GitHub
     url = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions?locale=ru&allowCountries=RU"
     games = []
     
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         data = response.json()
         
         elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
         
         for el in elements:
+            # Логика проверки раздачи
             promotions = el.get("promotions", {})
-            if not promotions:
-                continue
+            if not promotions: continue
                 
             offers = promotions.get("promotionalOffers", [])
-            if not offers:
-                continue
+            if not offers: continue
                 
             active_offers = offers[0].get("promotionalOffers", [])
             is_active = False
             for offer in active_offers:
-                start_date = offer.get("startDate")
-                end_date = offer.get("endDate")
-                if start_date and end_date:
+                if offer.get("startDate") and offer.get("endDate"):
                     is_active = True
                     break
-                    
-            if not is_active:
-                continue
+            if not is_active: continue
 
             price_info = el.get("price", {}).get("totalPrice", {})
-            discount = price_info.get("discount", 0)
-            original_price = price_info.get("originalPrice", 1)
-            
-            if discount < original_price and price_info.get("discountPrice", 0) != 0:
-                 continue
+            if price_info.get("discountPrice", 0) != 0: continue # Не 100% скидка
 
             title = el.get("title", "")
-            product_slug = el.get("productSlug")
-            url_slug = el.get("urlSlug")
+            description = el.get("description", "")
             
-            # EGS иногда меняет логику генерации URL
-            slug = product_slug if product_slug else url_slug
+            # Ссылка
+            slug = el.get("productSlug") or el.get("urlSlug")
             if not slug and el.get("catalogNs", {}).get("mappings"):
-                mappings = el["catalogNs"]["mappings"]
-                for mapping in mappings:
-                    if mapping.get("pageType") == "productHome":
-                        slug = mapping.get("pageSlug")
+                for m in el["catalogNs"]["mappings"]:
+                    if m.get("pageType") == "productHome":
+                        slug = m.get("pageSlug")
                         break
-                        
-            if not slug:
-                # Фоллбэк, если вообще нет слага
-                slug = title.lower().replace(" ", "-")
-                
+            if not slug: slug = title.lower().replace(" ", "-")
             game_url = f"https://store.epicgames.com/ru/p/{slug}"
             
+            # Картинка
             image_url = ""
-            key_images = el.get("keyImages", [])
-            # Ищем самый качественное изображение
-            priority_types = ["OfferImageWide", "DieselStoreFrontWide", "Thumbnail", "CodeRedemptionImages"]
+            priority_types = ["OfferImageWide", "DieselStoreFrontWide", "Thumbnail"]
             for p_type in priority_types:
-                for img in key_images:
+                for img in el.get("keyImages", []):
                     if img.get("type") == p_type:
                         image_url = img.get("url")
                         break
                 if image_url: break
-            
-            if not image_url and key_images:
-                 image_url = key_images[0].get("url", "")
-                 
-            game_id = f"epic_{el.get('id')}"
+            if not image_url and el.get("keyImages"): image_url = el["keyImages"][0].get("url")
+
+            # Цена (для гуманизации)
+            original_price = price_info.get("fmtPrice", {}).get("originalPrice", "0")
             
             games.append({
-                "id": game_id,
+                "id": f"epic_{el.get('id')}",
                 "title": f"[Epic Games] {title}",
                 "url": game_url,
                 "image_url": image_url,
-                "source": "EpicGames"
+                "description": description,
+                "source": "EpicGames",
+                "original_price": original_price
             })
             
     except Exception as e:
@@ -198,59 +222,73 @@ def fetch_epic_games_freebies() -> List[Dict]:
     return games
 
 def send_telegram_post(game: Dict) -> bool:
-    """Оформление и отправка поста"""
+    """Оформление и отправка 'живого' поста"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning(f"[ТЕСТОВЫЙ ЗАПУСК - ТОКЕНЫ НЕ ЗАДАНЫ] Пост: {game['title']} | {game['url']}")
+        logger.warning(f"[ТЕСТ] Пост: {game['title']}")
         return True
         
-    import random
-    greeting = random.choice(GREETINGS)
+    # 1. Выбираем приветствие
+    greeting = random.choice(GREETINGS_HUGE if random.random() > 0.4 else GREETINGS_CASUAL)
     
-    # Очистка названия от тегов
+    # 2. Чистим заголовок и определяем жанр (по ключевым словам для эмодзи)
     clean_title = game['title']
-    platform = ""
-    
-    if "[Steam]" in clean_title: platform = "🎮 <b>Steam</b>"
-    elif "[Epic Games]" in clean_title: platform = "⬛️ <b>Epic Games</b>"
-    elif "[GOG]" in clean_title: platform = "🟣 <b>GOG</b>"
-    elif "[Ubisoft]" in clean_title: platform = "🔵 <b>Ubisoft</b>"
-    
-    # Удаляем все теги в квадратных и круглых скобках для красоты
-    for tag in ["[Steam]", "[Epic Games]", "[GOG]", "[Ubisoft]", "[Origin]", "(Game)", "(DLC)", "(Other)", "[Itch.io]", "(Beta)"]:
+    for tag in ["[Steam]", "[Epic Games]", "[GOG]", "[Ubisoft]", "[Origin]", "(Game)", "(DLC)"]:
         clean_title = clean_title.replace(tag, "").strip()
-        
-    # Формируем итоговое сообщение (HTML)
+    
+    emoji = GENRE_EMOJIS["default"]
+    title_lower = clean_title.lower()
+    if "race" in title_lower or "drive" in title_lower: emoji = GENRE_EMOJIS["racing"]
+    elif "shot" in title_lower or "war" in title_lower or "gun" in title_lower: emoji = GENRE_EMOJIS["shooter"]
+    elif "horror" in title_lower or "scary" in title_lower: emoji = GENRE_EMOJIS["horror"]
+    elif "rpg" in title_lower or "quest" in title_lower: emoji = GENRE_EMOJIS["rpg"]
+    elif "strategy" in title_lower or "empire" in title_lower: emoji = GENRE_EMOJIS["strategy"]
+    
+    # 3. Формируем плашку платформы
+    platform = ""
+    if "[Steam]" in game['title']: platform = "🎮 <b>Steam</b>"
+    elif "[Epic Games]" in game['title'] or game['source'] == "EpicGames": platform = "⬛️ <b>Epic Games</b>"
+    elif "[GOG]" in game['title']: platform = "🟣 <b>GOG</b>"
+    
+    # 4. Собираем текст
     text = f"{greeting}\n\n"
     if platform:
         text += f"{platform}\n"
-    text += f"🎁 <b>{clean_title}</b>\n\n"
-    text += f"🔗 <a href='{game['url']}'>Забрать халяву</a>\n\n"
+    text += f"{emoji} <b>{clean_title}</b>\n\n"
+    
+    # Описание (если есть)
+    if game.get('description'):
+        # Краткая выжимка (первые 2 предложения или 150 символов)
+        desc = game['description'].split('. ')[0] # Берем первое предложение
+        if len(desc) > 150: desc = desc[:147] + "..."
+        text += f"<i>— {desc.strip()}</i>\n\n"
+    
+    # Цена (создаем ценность)
+    if game.get('original_price') and game['original_price'] != "0":
+        text += f"💰 Обычная цена: <s>{game['original_price']}</s> -> <b>БЕСПЛАТНО</b>\n\n"
+    else:
+        text += f"💰 Цена для тебя: <b>0 рублей</b>\n\n"
+        
+    text += f"🔗 <a href='{game['url']}'>ЗАБРАТЬ ПО ССЫЛКЕ</a>\n\n"
+    
+    # Прощалка
+    text += f"{random.choice(SIGN_OFFS)}\n\n"
     text += f"{TAGS}"
     
+    # 5. Отправка
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "parse_mode": "HTML"}
     if game['image_url']:
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "photo": game['image_url'],
-            "caption": text,
-            "parse_mode": "HTML",
-        }
+        payload.update({"photo": game['image_url'], "caption": text})
     else:
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        }
+        payload.update({"text": text, "disable_web_page_preview": False})
 
     try:
-        response = requests.post(api_url, data=payload, timeout=10)
+        response = requests.post(api_url, data=payload, timeout=12)
         response.raise_for_status()
-        logger.info(f"Успешный пост: {game['title']}")
         return True
     except Exception as e:
-        logger.error(f"Ошибка отправки в TG: {e}")
+        logger.error(f"Ошибка Telegram: {e}")
         return False
 
 def main():
@@ -259,36 +297,30 @@ def main():
     
     reddit_games = fetch_reddit_freebies()
     epic_games = fetch_epic_games_freebies()
-    
     all_new_games = reddit_games + epic_games
     
-    # Оставляем только те, что еще не постили
     to_post = [g for g in all_new_games if g["id"] not in posted_ids]
-    
     if not to_post:
-        logger.info("Новых раздач пока нет.")
+        logger.info("Новых раздач нет.")
         return
 
-    # Ограничиваем количество постов за один запуск
+    # Берем самые свежие и ограничиваем лимит
     to_post = list(reversed(to_post))[:MAX_POSTS_PER_RUN]
     
     posted_count = 0
     for i, game in enumerate(to_post):
-        # Логика задержки (пауза после каждых BATCH_SIZE постов)
         if i > 0 and i % BATCH_SIZE == 0:
-            logger.info(f"Пауза {BATCH_DELAY} секунд между пачками постов...")
+            logger.info(f"Пауза {BATCH_DELAY} сек...")
             time.sleep(BATCH_DELAY)
 
-        logger.info(f"Публикация: {game['title']}")
         if send_telegram_post(game):
             posted_ids.append(game["id"])
             save_posted_ids(posted_ids)
             posted_count += 1
-            # Короткая пауза внутри пачки
-            time.sleep(5)
+            time.sleep(10) # Анти-спам внутри пачки
                 
     if posted_count > 0:
-        logger.info(f"Успешно опубликовано раздач в этом запуске: {posted_count}")
+        logger.info(f"Опубликовано: {posted_count}")
 
 if __name__ == "__main__":
     main()
