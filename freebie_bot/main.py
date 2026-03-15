@@ -41,50 +41,58 @@ def save_posted_ids(ids: List[str]):
         json.dump(ids[-500:], f, indent=4)
 
 def fetch_reddit_freebies() -> List[Dict]:
-    """Парсинг сабреддита /r/FreeGameFindings"""
+    """Парсинг сабреддита /r/FreeGameFindings через RSS (более стабильно для ботов)"""
     logger.info("Поиск на Reddit...")
-    url = "https://www.reddit.com/r/FreeGameFindings/new.json?limit=15"
-    headers = {"User-Agent": "python:freebie_telegram_bot:v1.0 (by u/No_Name)"}
+    url = "https://www.reddit.com/r/FreeGameFindings/new/.rss"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    }
     games = []
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        data = response.json()
-        children = data.get("data", {}).get("children", [])
         
-        for child in children:
-            post = child.get("data", {})
-            title = post.get("title", "")
+        soup = BeautifulSoup(response.content, features="xml")
+        entries = soup.find_all("entry")
+        
+        for entry in entries:
+            title = entry.find("title").text if entry.find("title") else ""
+            link_tag = entry.find("link")
+            url = link_tag.get("href") if link_tag else ""
+            id_tag = entry.find("id")
+            post_id = id_tag.text.split("/")[-1] if id_tag else str(time.time())
             
-            # Строгая фильтрация от мусора
-            if any(x.lower() in title.lower() for x in ["[Discussion]", "[PSA]", "Megathread", "Thread", "Ended"]):
+            # Фильтрация
+            if any(x.lower() in title.lower() for x in ["[Discussion]", "[PSA]", "Megathread", "Thread", "Ended", "Expired"]):
                 continue
-                
+            
+            # В RSS картинки часто лежат внутри description в виде <img>
             image_url = ""
-            preview = post.get("preview", {})
-            if preview and preview.get("images"):
-                try:
-                    image_url = preview["images"][0]["source"]["url"].replace("&amp;", "&")
-                except (KeyError, IndexError):
-                    pass
-                    
+            content = entry.find("content").text if entry.find("content") else ""
+            if content:
+                c_soup = BeautifulSoup(content, "html.parser")
+                img = c_soup.find("img")
+                if img:
+                    image_url = img.get("src")
+
             games.append({
-                "id": f"reddit_{post.get('id')}",
+                "id": f"reddit_{post_id}",
                 "title": title,
-                "url": post.get("url", ""),
+                "url": url,
                 "image_url": image_url,
                 "source": "Reddit"
             })
     except Exception as e:
-        logger.error(f"Ошибка Reddit API: {e}")
+        logger.error(f"Ошибка Reddit RSS: {e}")
         
     return games
 
 def fetch_epic_games_freebies() -> List[Dict]:
     """Парсинг официального API раздач Epic Games Store"""
     logger.info("Поиск в Epic Games...")
-    url = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions?locale=ru&country=RU&allowCountries=RU"
+    # Убираем жесткую привязку к RU, чтобы избежать пустых ответов из-за региональных ограничений GitHub
+    url = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions?locale=ru&allowCountries=RU"
     games = []
     
     try:
@@ -143,11 +151,14 @@ def fetch_epic_games_freebies() -> List[Dict]:
             
             image_url = ""
             key_images = el.get("keyImages", [])
-            # Ищем лучшую горизонтальную обложку
-            for img in key_images:
-                if img.get("type") in ["OfferImageWide", "DieselStoreFrontWide"]:
-                    image_url = img.get("url")
-                    break
+            # Ищем самый качественное изображение
+            priority_types = ["OfferImageWide", "DieselStoreFrontWide", "Thumbnail", "CodeRedemptionImages"]
+            for p_type in priority_types:
+                for img in key_images:
+                    if img.get("type") == p_type:
+                        image_url = img.get("url")
+                        break
+                if image_url: break
             
             if not image_url and key_images:
                  image_url = key_images[0].get("url", "")
