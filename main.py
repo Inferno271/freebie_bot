@@ -18,12 +18,19 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 POSTED_IDS_FILE = "posted_ids.json"
 
-TAGS = "#халява #бесплатно #free"
+# Настройки пауз и лимитов (чтобы не спамить всё сразу)
+MAX_POSTS_PER_RUN = 6    # Максимум постов за один запуск (раз в час)
+BATCH_SIZE = 2           # Сколько постов слать подряд
+BATCH_DELAY = 600        # Пауза между пачками постов (в секундах, например 600 = 10 мин)
+
+TAGS = "#халява #бесплатно #free #игры"
 GREETINGS = [
-    "🔥 Горячая раздача!",
-    "💸 Забирай, пока бесплатно!",
-    "🎮 100% скидка подъехала!",
-    "🚀 Срочно на аккаунт!"
+    "🔥 <b>ПОДЪЕХАЛА ГОДНОТА!</b>",
+    "💸 <b>ЗАБИРАЙ, ПОКА БЕСПЛАТНО!</b>",
+    "🎮 <b>100% СКИДКА! ТАКОЕ МЫ БЕРЕМ!</b>",
+    "🚀 <b>СРОЧНЫЙ ДРОП! НАЛЕТАЙ!</b>",
+    "🎁 <b>ПОДАРОЧЕК ДЛЯ ВАШЕЙ БИБЛИОТЕКИ!</b>",
+    "✨ <b>НОВЫЙ ЛУТ В КОЛЛЕКЦИЮ!</b>"
 ]
 
 def load_posted_ids() -> List[str]:
@@ -67,19 +74,31 @@ def fetch_reddit_freebies() -> List[Dict]:
             if any(x.lower() in title.lower() for x in ["[Discussion]", "[PSA]", "Megathread", "Thread", "Ended", "Expired"]):
                 continue
             
-            # В RSS картинки часто лежат внутри description в виде <img>
-            image_url = ""
+            # В RSS ссылка в теге <link> ведет на Reddit. 
+            # Нам нужна ПРЯМАЯ ссылка на магазин/сайт.
+            # Она обычно запрятана в <content> внутри тега <a> с текстом [link]
+            direct_url = ""
             content = entry.find("content").text if entry.find("content") else ""
             if content:
                 c_soup = BeautifulSoup(content, "html.parser")
+                # Ищем ссылку, которая содержит текст [link]
+                for a in c_soup.find_all("a"):
+                    if "[link]" in a.text:
+                        direct_url = a.get("href")
+                        break
+                
+                # Поиск картинки (если есть)
                 img = c_soup.find("img")
                 if img:
                     image_url = img.get("src")
 
+            # Если не нашли прямую ссылку, берем ссылку на пост в Reddit
+            final_url = direct_url if direct_url else url
+
             games.append({
                 "id": f"reddit_{post_id}",
                 "title": title,
-                "url": url,
+                "url": final_url,
                 "image_url": image_url,
                 "source": "Reddit"
             })
@@ -243,19 +262,33 @@ def main():
     
     all_new_games = reddit_games + epic_games
     
-    posted_count = 0
-    # Идем с конца для правильного хронологического порядка
-    for game in reversed(all_new_games):
-        if game["id"] not in posted_ids:
-            logger.info(f"Новая раздача найдена: {game['title']}")
-            if send_telegram_post(game):
-                posted_ids.append(game["id"])
-                save_posted_ids(posted_ids)
-                posted_count += 1
-                time.sleep(3) # Anti-Spam пауза
-                
-    if posted_count == 0:
+    # Оставляем только те, что еще не постили
+    to_post = [g for g in all_new_games if g["id"] not in posted_ids]
+    
+    if not to_post:
         logger.info("Новых раздач пока нет.")
+        return
+
+    # Ограничиваем количество постов за один запуск
+    to_post = list(reversed(to_post))[:MAX_POSTS_PER_RUN]
+    
+    posted_count = 0
+    for i, game in enumerate(to_post):
+        # Логика задержки (пауза после каждых BATCH_SIZE постов)
+        if i > 0 and i % BATCH_SIZE == 0:
+            logger.info(f"Пауза {BATCH_DELAY} секунд между пачками постов...")
+            time.sleep(BATCH_DELAY)
+
+        logger.info(f"Публикация: {game['title']}")
+        if send_telegram_post(game):
+            posted_ids.append(game["id"])
+            save_posted_ids(posted_ids)
+            posted_count += 1
+            # Короткая пауза внутри пачки
+            time.sleep(5)
+                
+    if posted_count > 0:
+        logger.info(f"Успешно опубликовано раздач в этом запуске: {posted_count}")
 
 if __name__ == "__main__":
     main()
