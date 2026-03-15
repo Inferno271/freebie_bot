@@ -104,8 +104,18 @@ def fetch_reddit_freebies() -> List[Dict]:
             link_tag = entry.find("link")
             url = link_tag.get("href") if link_tag else ""
             id_tag = entry.find("id")
-            post_id = id_tag.text.split("/")[-1] if id_tag else str(time.time())
+            # Извлекаем ID поста более надежно
+            post_id = ""
+            if id_tag:
+                post_id = id_tag.text.split("/")[-1]
+            if not post_id and link_tag:
+                # Если нет ID, пытаемся вытащить его из URL сабреддита
+                post_id = url.split("/comments/")[-1].split("/")[0]
             
+            if not post_id:
+                post_id = title.replace(" ", "_")[:50] # Последний шанс: ID из названия
+            
+            # Фильтрация
             if any(x.lower() in title.lower() for x in ["[Discussion]", "[PSA]", "Megathread", "Thread", "Ended", "Expired"]):
                 continue
             
@@ -230,39 +240,62 @@ def send_telegram_post(game: Dict) -> bool:
     # 1. Выбираем приветствие
     greeting = random.choice(GREETINGS_HUGE if random.random() > 0.4 else GREETINGS_CASUAL)
     
-    # 2. Чистим заголовок и определяем жанр (по ключевым словам для эмодзи)
+    # 2. Чистим заголовок и определяем платформу/жанр
     clean_title = game['title']
-    for tag in ["[Steam]", "[Epic Games]", "[GOG]", "[Ubisoft]", "[Origin]", "(Game)", "(DLC)"]:
+    platform_tag = ""
+    dynamic_tags = ["#халява", "#бесплатно"]
+
+    if "[Steam]" in clean_title: 
+        platform_name = "🎮 <b>Steam</b>"
+        platform_tag = "#Steam"
+    elif "[Epic Games]" in clean_title or game['source'] == "EpicGames": 
+        platform_name = "⬛️ <b>Epic Games</b>"
+        platform_tag = "#EGS #EpicGames"
+    elif "[GOG]" in clean_title: 
+        platform_name = "🟣 <b>GOG</b>"
+        platform_tag = "#GOG"
+    elif "[Ubisoft]" in clean_title:
+        platform_name = "🔵 <b>Ubisoft</b>"
+        platform_tag = "#Ubisoft"
+    else:
+        platform_name = "👾 <b>PC</b>"
+
+    if platform_tag:
+        dynamic_tags.append(platform_tag)
+
+    for tag in ["[Steam]", "[Epic Games]", "[GOG]", "[Ubisoft]", "[Origin]", "(Game)", "(DLC)", "[Itch.io]", "(Beta)"]:
         clean_title = clean_title.replace(tag, "").strip()
     
     emoji = GENRE_EMOJIS["default"]
     title_lower = clean_title.lower()
-    if "race" in title_lower or "drive" in title_lower: emoji = GENRE_EMOJIS["racing"]
-    elif "shot" in title_lower or "war" in title_lower or "gun" in title_lower: emoji = GENRE_EMOJIS["shooter"]
-    elif "horror" in title_lower or "scary" in title_lower: emoji = GENRE_EMOJIS["horror"]
-    elif "rpg" in title_lower or "quest" in title_lower: emoji = GENRE_EMOJIS["rpg"]
-    elif "strategy" in title_lower or "empire" in title_lower: emoji = GENRE_EMOJIS["strategy"]
+    if "race" in title_lower or "drive" in title_lower: 
+        emoji = GENRE_EMOJIS["racing"]
+        dynamic_tags.append("#гонки")
+    elif "shot" in title_lower or "war" in title_lower or "gun" in title_lower: 
+        emoji = GENRE_EMOJIS["shooter"]
+        dynamic_tags.append("#шутер")
+    elif "horror" in title_lower or "scary" in title_lower: 
+        emoji = GENRE_EMOJIS["horror"]
+        dynamic_tags.append("#хоррор")
+    elif "rpg" in title_lower or "quest" in title_lower: 
+        emoji = GENRE_EMOJIS["rpg"]
+        dynamic_tags.append("#rpg")
+    elif "strategy" in title_lower or "empire" in title_lower: 
+        emoji = GENRE_EMOJIS["strategy"]
+        dynamic_tags.append("#стратегия")
     
-    # 3. Формируем плашку платформы
-    platform = ""
-    if "[Steam]" in game['title']: platform = "🎮 <b>Steam</b>"
-    elif "[Epic Games]" in game['title'] or game['source'] == "EpicGames": platform = "⬛️ <b>Epic Games</b>"
-    elif "[GOG]" in game['title']: platform = "🟣 <b>GOG</b>"
-    
-    # 4. Собираем текст
+    # 3. Собираем текст
     text = f"{greeting}\n\n"
-    if platform:
-        text += f"{platform}\n"
+    text += f"{platform_name}\n"
     text += f"{emoji} <b>{clean_title}</b>\n\n"
     
-    # Описание (если есть)
+    # Описание
     if game.get('description'):
-        # Краткая выжимка (первые 2 предложения или 150 символов)
-        desc = game['description'].split('. ')[0] # Берем первое предложение
+        desc = game['description'].split('. ')[0]
         if len(desc) > 150: desc = desc[:147] + "..."
         text += f"<i>— {desc.strip()}</i>\n\n"
     
-    # Цена (создаем ценность)
+    # Цена
     if game.get('original_price') and game['original_price'] != "0":
         text += f"💰 Обычная цена: <s>{game['original_price']}</s> -> <b>БЕСПЛАТНО</b>\n\n"
     else:
@@ -272,7 +305,7 @@ def send_telegram_post(game: Dict) -> bool:
     
     # Прощалка
     text += f"{random.choice(SIGN_OFFS)}\n\n"
-    text += f"{TAGS}"
+    text += " ".join(list(set(dynamic_tags))) # Удаляем дубликаты тегов
     
     # 5. Отправка
     payload = {"chat_id": TELEGRAM_CHAT_ID, "parse_mode": "HTML"}
